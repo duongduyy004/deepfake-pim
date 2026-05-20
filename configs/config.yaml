@@ -1,0 +1,16 @@
+root_dir: "data/face_crops"
+save_dir: "checkpoints"
+image_size: 224
+batch_size: 32
+num_workers: 4
+epochs: 30
+lr: 0.0001
+weight_decay: 0.0001
+alpha: 1.0
+r: 0.1
+patience_scheduler: 2
+patience_early_stopping: 7
+num_classes: 2
+model_name: "convnext_base"
+pretrained: true
+seed: 42
