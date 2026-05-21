@@ -1,14 +1,25 @@
 """
 DeepfakeFrameDataset
 ====================
-Scans  root/split/class_name/video_folder/image.*
-Each image is one independent sample (frame-level).
+Scans  root/split/class_name/image.*
+Images are stored directly inside each class folder (no video subfolder).
 
 Label mapping
 -------------
   original                                    -> 0  (real)
   Deepfakes / Face2Face / FaceShifter /
   FaceSwap / NeuralTextures                   -> 1  (fake)
+
+Upsampling (train split only)
+------------------------------
+  original_upsample_factor = N  (total multiplier):
+    - 1 base copy per image  -> base_transform  (no augmentation)
+    - N-1 extra copies        -> train_transform (with augmentation)
+  Fake images always use train_transform in the train split.
+
+Val / Test
+----------
+  All images use the provided transform (resize + normalize only).
 """
 
 from pathlib import Path
@@ -39,22 +50,15 @@ def get_transforms(split: str, image_size: int = 224) -> A.Compose:
     """
     Return albumentations transform pipeline for the requested split.
 
-    Train: resize, flip, rotate, random-resized-crop (zoom), blur,
+    Train: resize, flip, rotate, random-resized-crop, blur,
            gaussian noise, normalize, ToTensor.
     Val / Test: resize, normalize, ToTensor.
-
-    Note on albumentations API compatibility
-    ----------------------------------------
-    RandomResizedCrop uses ``height`` / ``width`` kwargs (albumentations < 1.4).
-    If you use albumentations >= 1.4, replace them with ``size=(image_size, image_size)``.
     """
     if split == "train":
         return A.Compose([
-            # Base resize — ensures fixed size even when RandomResizedCrop is skipped
             A.Resize(image_size, image_size),
             A.HorizontalFlip(p=0.5),
             A.Rotate(limit=15, border_mode=cv2.BORDER_REFLECT_101, p=0.5),
-            # Zoom in / zoom out: scale < 1 zooms in, scale > 1 zooms out
             A.RandomResizedCrop(
                 height=image_size,
                 width=image_size,
@@ -62,18 +66,15 @@ def get_transforms(split: str, image_size: int = 224) -> A.Compose:
                 ratio=(0.75, 1.33),
                 p=0.5,
             ),
-            # Blur (randomly pick one type)
             A.OneOf([
                 A.GaussianBlur(blur_limit=(3, 7), p=1.0),
                 A.MotionBlur(blur_limit=7, p=1.0),
             ], p=0.3),
-            # Gaussian noise
             A.GaussNoise(var_limit=(10.0, 50.0), p=0.3),
             A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
             ToTensorV2(),
         ])
     else:
-        # val / test — deterministic
         return A.Compose([
             A.Resize(image_size, image_size),
             A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
@@ -92,17 +93,23 @@ class DeepfakeFrameDataset(Dataset):
     Directory layout expected::
 
         root_dir/
-        └── split/                 # train | val | test
+        └── split/              # train | val | test
             ├── original/
-            │   └── <video_id>/
-            │       ├── 000.jpg
-            │       └── ...
+            │   ├── 000.jpg
+            │   └── ...
             └── Deepfakes/
-                └── <video_id>/
-                    ├── 000.jpg
-                    └── ...
+                ├── 000.jpg
+                └── ...
 
-    Each image file is a single sample; no video-level aggregation.
+    Images are placed directly in the class folder (no video subfolder).
+
+    Train split — per-sample transform rules:
+      original (base copy):      transform      (no augmentation)
+      original (upsampled N-1):  train_transform (augmentation)
+      fake:                      train_transform (augmentation)
+
+    Val / Test split:
+      all images use transform   (no augmentation)
     """
 
     def __init__(
@@ -110,26 +117,37 @@ class DeepfakeFrameDataset(Dataset):
         root_dir: str,
         split: str,
         transform: Optional[Callable] = None,
+        upsample_factor: int = 1,
+        train_transform: Optional[Callable] = None,
     ) -> None:
         """
         Args:
-            root_dir: path to the dataset root folder
-            split:    one of "train", "val", "test"
-            transform: albumentations Compose (or any callable that accepts
-                       ``image=np.ndarray`` keyword and returns a dict)
+            root_dir:         path to dataset root folder
+            split:            one of "train", "val", "test"
+            transform:        base transform — used for val/test and for the
+                              original base copy in train (resize + normalize)
+            upsample_factor:  total multiplier for original class in train split.
+                              1 = no upsampling; 2 = 2x total (1 base + 1 augmented)
+            train_transform:  augmentation transform used for upsampled original
+                              copies and for all fake images in train split
         """
         self.root_dir = Path(root_dir)
         self.split = split
-        self.transform = transform
-        self.samples: list[Tuple[str, int]] = []
-        self._scan()
+        # Each entry: (img_path, label, callable_transform)
+        self.samples: list[Tuple[str, int, Optional[Callable]]] = []
+        self._scan(transform, upsample_factor, train_transform)
 
-    def _scan(self) -> None:
+    def _scan(
+        self,
+        base_transform: Optional[Callable],
+        upsample_factor: int,
+        train_transform: Optional[Callable],
+    ) -> None:
         split_dir = self.root_dir / self.split
         if not split_dir.exists():
             raise FileNotFoundError(
                 f"Split directory not found: {split_dir}\n"
-                f"Expected structure: {self.root_dir}/<split>/<class>/<video>/<image>"
+                f"Expected: {self.root_dir}/<split>/<class>/<image>"
             )
 
         for class_dir in sorted(split_dir.iterdir()):
@@ -142,15 +160,28 @@ class DeepfakeFrameDataset(Dataset):
             elif class_name in FAKE_CLASSES:
                 label = 1
             else:
-                # Unknown class — skip silently
                 continue
 
-            for video_dir in sorted(class_dir.iterdir()):
-                if not video_dir.is_dir():
-                    continue
-                for img_path in sorted(video_dir.iterdir()):
-                    if img_path.suffix.lower() in SUPPORTED_EXTS:
-                        self.samples.append((str(img_path), label))
+            img_paths = sorted([
+                p for p in class_dir.iterdir()
+                if p.is_file() and p.suffix.lower() in SUPPORTED_EXTS
+            ])
+
+            if self.split == "train":
+                if label == 0:  # original / real
+                    # Base copy: no augmentation
+                    for p in img_paths:
+                        self.samples.append((str(p), 0, base_transform))
+                    # Extra upsampled copies: with augmentation
+                    for _ in range(upsample_factor - 1):
+                        for p in img_paths:
+                            self.samples.append((str(p), 0, train_transform))
+                else:  # fake
+                    for p in img_paths:
+                        self.samples.append((str(p), 1, train_transform))
+            else:  # val / test
+                for p in img_paths:
+                    self.samples.append((str(p), label, base_transform))
 
         if len(self.samples) == 0:
             raise RuntimeError(
@@ -165,19 +196,19 @@ class DeepfakeFrameDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple:
         """
         Returns:
-            image  : FloatTensor [3, H, W]
-            label  : int  (0 = real, 1 = fake)
-            path   : str  (absolute path to the image file)
+            image : FloatTensor [3, H, W]
+            label : int  (0 = real, 1 = fake)
+            path  : str  (absolute path to the image file)
         """
-        img_path, label = self.samples[idx]
+        img_path, label, transform = self.samples[idx]
 
         image = cv2.imread(img_path, cv2.IMREAD_COLOR)
         if image is None:
             raise IOError(f"cv2.imread failed for: {img_path}")
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-        if self.transform is not None:
-            augmented = self.transform(image=image)
-            image = augmented["image"]   # FloatTensor after ToTensorV2
+        if transform is not None:
+            augmented = transform(image=image)
+            image = augmented["image"]
 
         return image, label, img_path

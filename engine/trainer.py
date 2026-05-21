@@ -7,7 +7,7 @@ Checkpoint layout
   model_state_dict
   optimizer_state_dict
   scheduler_state_dict
-  best_val_loss
+  best_val_auc
   config             — full config dict for reproducibility
 """
 
@@ -41,7 +41,7 @@ def train(
     val_loader: torch.utils.data.DataLoader,
     test_loader: torch.utils.data.DataLoader,
     optimizer: torch.optim.Optimizer,
-    scheduler,          # ReduceLROnPlateau
+    scheduler,          # ReduceLROnPlateau(mode='max')
     config: dict,
     device: torch.device,
     save_dir: str,
@@ -51,9 +51,10 @@ def train(
 
     Trains for up to config['epochs'] epochs with:
       - PIM gradient-regularization on the training set
-      - ReduceLROnPlateau on val_loss after every epoch
-      - Best checkpoint saving when val_loss improves
-      - Early stopping after config['patience_early_stopping'] stagnant epochs
+      - MixUp augmentation (if mixup_alpha > 0)
+      - ReduceLROnPlateau(mode='max') on val AUC after every epoch
+      - Best checkpoint saving when val AUC improves -> best_auc_model.pth
+      - Early stopping after config['early_stopping_patience'] stagnant epochs
 
     After training, loads the best checkpoint and evaluates on test_loader.
 
@@ -61,16 +62,17 @@ def train(
         test_metrics dict
     """
     Path(save_dir).mkdir(parents=True, exist_ok=True)
-    best_ckpt_path = os.path.join(save_dir, "best_model.pth")
+    best_ckpt_path = os.path.join(save_dir, "best_auc_model.pth")
 
     criterion = nn.CrossEntropyLoss()
 
     max_epochs = config.get("epochs", 30)
-    patience_es = config.get("patience_early_stopping", 7)
+    patience_es = config.get("early_stopping_patience", 5)
     alpha = config.get("alpha", 1.0)
     r = config.get("r", 0.1)
+    mixup_alpha = config.get("mixup_alpha", 0.0)
 
-    best_val_loss = float("inf")
+    best_val_auc = 0.0
     epochs_no_improve = 0
 
     for epoch in range(1, max_epochs + 1):
@@ -80,25 +82,26 @@ def train(
 
         # ---- Train ----
         train_metrics = train_one_epoch(
-            model, train_loader, optimizer, device, alpha=alpha, r=r
+            model, train_loader, optimizer, device,
+            alpha=alpha, r=r, mixup_alpha=mixup_alpha,
         )
 
         # ---- Validate ----
         val_metrics = valid_on_test(model, val_loader, device, criterion)
 
-        # ---- Scheduler step on val_loss ----
-        val_loss = val_metrics["loss"]
-        scheduler.step(val_loss)
+        # ---- Scheduler step on val AUC (mode='max') ----
+        val_auc = val_metrics["auc"]
+        scheduler.step(val_auc)
         current_lr = optimizer.param_groups[0]["lr"]
 
         # ---- Log ----
         print(f"  Train  |  {_fmt(train_metrics)}")
         print(f"  Val    |  {_fmt(val_metrics)}")
-        print(f"  LR: {current_lr:.2e}  |  Best Val Loss: {best_val_loss:.4f}")
+        print(f"  LR: {current_lr:.2e}  |  Best Val AUC: {best_val_auc:.4f}")
 
-        # ---- Checkpoint ----
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        # ---- Checkpoint: save when val AUC improves ----
+        if val_auc > best_val_auc:
+            best_val_auc = val_auc
             epochs_no_improve = 0
 
             save_checkpoint(
@@ -107,12 +110,12 @@ def train(
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scheduler_state_dict": scheduler.state_dict(),
-                    "best_val_loss": best_val_loss,
+                    "best_val_auc": best_val_auc,
                     "config": config,
                 },
                 best_ckpt_path,
             )
-            print(f"  -> Checkpoint saved  (val_loss={best_val_loss:.4f})")
+            print(f"  -> Checkpoint saved  (val_auc={best_val_auc:.4f})")
         else:
             epochs_no_improve += 1
             print(f"  -> No improvement  ({epochs_no_improve}/{patience_es})")
@@ -124,7 +127,7 @@ def train(
 
     # ---- Final test evaluation on best checkpoint ----
     print(f"\n{_SEP}")
-    print("  Loading best checkpoint for test evaluation …")
+    print("  Loading best checkpoint for test evaluation ...")
     print(_SEP)
 
     checkpoint = torch.load(best_ckpt_path, map_location=device)

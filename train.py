@@ -1,10 +1,10 @@
 """
-Entry point for training ConvNeXt-Base + PIM deepfake detector.
+Entry point for training EfficientNet-B4 + PIM deepfake detector.
 
 Example
 -------
   python train.py \\
-      --root_dir "F:/DeepFakedata/face_crops" \\
+      --root_dir "D:/duong_huy_ct7/deepfake-data" \\
       --save_dir "checkpoints" \\
       --batch_size 32 \\
       --epochs 30
@@ -23,7 +23,7 @@ from torch.utils.data import DataLoader
 
 from datasets.deepfake_dataset import DeepfakeFrameDataset, get_transforms
 from engine.trainer import train
-from models.convnext_pim import ConvNeXtPIMDetector
+from models.efficientnet_pim import EfficientNetB4PIMDetector
 from utils.seed import set_seed
 
 
@@ -33,7 +33,7 @@ from utils.seed import set_seed
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train ConvNeXt-Base + PIM deepfake detector"
+        description="Train EfficientNet-B4 + PIM deepfake detector"
     )
     parser.add_argument("--root_dir", type=str, default=None,
                         help="Path to dataset root folder (overrides config)")
@@ -63,40 +63,55 @@ def main() -> None:
 
     # CLI overrides
     overrides = {
-        "root_dir": args.root_dir,
-        "save_dir": args.save_dir,
-        "batch_size": args.batch_size,
+        "root_dir":    args.root_dir,
+        "save_dir":    args.save_dir,
+        "batch_size":  args.batch_size,
         "num_workers": args.num_workers,
-        "epochs": args.epochs,
-        "lr": args.lr,
+        "epochs":      args.epochs,
+        "lr":          args.lr,
     }
     for key, value in overrides.items():
         if value is not None:
             config[key] = value
 
-    # Reproducibility
     set_seed(config["seed"])
 
-    # Device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     if device.type == "cuda":
         print(f"  GPU: {torch.cuda.get_device_name(0)}")
 
-    # Save directory
     Path(config["save_dir"]).mkdir(parents=True, exist_ok=True)
 
     # ---- Transforms ----
     train_tf = get_transforms("train", image_size=config["image_size"])
-    val_tf = get_transforms("val",   image_size=config["image_size"])
-    test_tf = get_transforms("test",  image_size=config["image_size"])
+    val_tf   = get_transforms("val",   image_size=config["image_size"])
+    test_tf  = get_transforms("test",  image_size=config["image_size"])
 
     # ---- Datasets ----
-    train_ds = DeepfakeFrameDataset(config["root_dir"], "train", train_tf)
-    val_ds   = DeepfakeFrameDataset(config["root_dir"], "val",   val_tf)
-    test_ds  = DeepfakeFrameDataset(config["root_dir"], "test",  test_tf)
+    # Train: base_transform (no augment) for original; train_tf for upsampled+fake
+    train_ds = DeepfakeFrameDataset(
+        root_dir=config["root_dir"],
+        split="train",
+        transform=val_tf,
+        upsample_factor=config.get("original_upsample_factor", 1),
+        train_transform=train_tf,
+    )
+    val_ds = DeepfakeFrameDataset(
+        root_dir=config["root_dir"],
+        split="val",
+        transform=val_tf,
+    )
+    test_ds = DeepfakeFrameDataset(
+        root_dir=config["root_dir"],
+        split="test",
+        transform=test_tf,
+    )
 
-    print(f"\nDataset sizes  —  train: {len(train_ds)}  val: {len(val_ds)}  test: {len(test_ds)}")
+    print(
+        f"\nDataset sizes  —  "
+        f"train: {len(train_ds)}  val: {len(val_ds)}  test: {len(test_ds)}"
+    )
 
     # ---- DataLoaders ----
     loader_kwargs = dict(
@@ -109,11 +124,14 @@ def main() -> None:
     test_loader  = DataLoader(test_ds,  shuffle=False, **loader_kwargs)
 
     # ---- Model ----
-    print(f"\nBuilding {config['model_name']} + PIM  (pretrained={config['pretrained']}) …")
-    model = ConvNeXtPIMDetector(
-        model_name=config["model_name"],
+    print(
+        f"\nBuilding EfficientNet-B4 + PIM  "
+        f"(pretrained={config['pretrained']}, dropout={config.get('dropout_rate', 0.5)}) ..."
+    )
+    model = EfficientNetB4PIMDetector(
         pretrained=config["pretrained"],
         num_classes=config["num_classes"],
+        dropout_rate=config.get("dropout_rate", 0.5),
     ).to(device)
 
     # ---- Optimizer ----
@@ -123,16 +141,20 @@ def main() -> None:
         weight_decay=config["weight_decay"],
     )
 
-    # ---- Scheduler — steps on val_loss after every epoch ----
+    # ---- Scheduler: maximize AUC ----
     scheduler = ReduceLROnPlateau(
         optimizer,
-        mode="min",
+        mode="max",
         factor=0.5,
         patience=config["patience_scheduler"],
     )
 
     # ---- Train ----
-    print(f"\nStarting training  (alpha={config['alpha']}, r={config['r']}) …\n")
+    print(
+        f"\nStarting training  "
+        f"(alpha={config['alpha']}, r={config['r']}, "
+        f"mixup_alpha={config.get('mixup_alpha', 0.0)}) ...\n"
+    )
     train(
         model=model,
         train_loader=train_loader,
