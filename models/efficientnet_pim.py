@@ -39,13 +39,13 @@ class EfficientNetB4PIMDetector(nn.Module):
             num_classes=num_classes,
         )
 
-        # Stem: conv_stem -> bn1 -> act1
+        # Stem: conv_stem -> bn1 [-> act1 if exists as separate module]
+        # In newer timm, bn1 is BatchNormAct2d (bn + act combined), no act1.
         # Output: [B, 48, H/2, W/2]
-        self.stem = nn.Sequential(
-            backbone.conv_stem,
-            backbone.bn1,
-            backbone.act1,
-        )
+        stem_modules = [backbone.conv_stem, backbone.bn1]
+        if hasattr(backbone, "act1"):
+            stem_modules.append(backbone.act1)
+        self.stem = nn.Sequential(*stem_modules)
 
         # stage0: blocks[0] (stride 1, 24ch) + blocks[1] (stride 2, 32ch)
         # Output: [B, 32, H/4, W/4]  e.g. 56x56 for 224 input
@@ -53,13 +53,11 @@ class EfficientNetB4PIMDetector(nn.Module):
         self.stage0 = nn.Sequential(*blocks_list[:2])
 
         # Remaining stages + feature head
-        # blocks[2..6] + conv_head (->1792ch) + bn2 + act2
-        self.stages_rest = nn.Sequential(
-            *blocks_list[2:],
-            backbone.conv_head,
-            backbone.bn2,
-            backbone.act2,
-        )
+        # blocks[2..6] + conv_head (->1792ch) + bn2 [+ act2 if exists]
+        stages_rest_modules = list(blocks_list[2:]) + [backbone.conv_head, backbone.bn2]
+        if hasattr(backbone, "act2"):
+            stages_rest_modules.append(backbone.act2)
+        self.stages_rest = nn.Sequential(*stages_rest_modules)
 
         # Classification head: global pool -> dropout -> linear
         self.global_pool = backbone.global_pool
