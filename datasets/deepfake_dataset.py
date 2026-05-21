@@ -60,9 +60,8 @@ def get_transforms(split: str, image_size: int = 224) -> A.Compose:
             A.HorizontalFlip(p=0.5),
             A.Rotate(limit=15, border_mode=cv2.BORDER_REFLECT_101, p=0.5),
             A.RandomResizedCrop(
-                height=image_size,
-                width=image_size,
-                scale=(0.7, 1.3),
+                size=(image_size, image_size),
+                scale=(0.7, 1.0),
                 ratio=(0.75, 1.33),
                 p=0.5,
             ),
